@@ -84,6 +84,65 @@ def convert_instance_norm(ctx):
         
         output._trt = result_trt
         
+
+@tensorrt_converter('torch.layer_norm')
+@tensorrt_converter('torch.nn.functional.layer_norm')
+def convert_layer_norm(ctx):
+    # very similar to convert_instance_norm's use_input_stats branch
+    input = get_arg(ctx, 'input', pos=0, default=None)
+    normalized_shape = get_arg(ctx, 'normalized_shape', pos=1, default=None)
+    weight = get_arg(ctx, 'weight', pos=2, default=None)
+    bias = get_arg(ctx, 'bias', pos=3, default=None)
+    eps = get_arg(ctx, 'eps', pos=4, default=1e-05)
+    output = ctx.method_return
+
+    eps_np = np.array([eps], dtype=np.float32)
+    keep_dims = True
+    num_normalized_dims = len(normalized_shape)
+
+    # two versions of the same reduce_axes
+    # one for before the reshape (below), and one for after the reshape
+    reduce_axes = torch_dim_to_trt_axes(tuple(range(input.ndim - num_normalized_dims, input.ndim)))
+    reduce_axes_adv = torch_dim_to_trt_axes(tuple(range(input.ndim+1 - num_normalized_dims, input.ndim+3)))
+
+
+    # normalize values for this instance (compute mean and var)
+    mean_trt = ctx.network.add_reduce(input._trt, trt.ReduceOperation.AVG, reduce_axes, keep_dims).get_output(0)
+    delta_trt = ctx.network.add_elementwise(input._trt, mean_trt, trt.ElementWiseOperation.SUB).get_output(0)
+
+    orig_shape = delta_trt.shape
+    assert len(orig_shape) != 3
+    layer = ctx.network.add_shuffle(delta_trt)
+
+    # add_scale_nd (around the end of this function) assumes CHW,
+    # but our input is length x num_features;
+    # in fact, it isn't even an image to begin with...
+    # we simply append 1s at end to represent a non-existent H and W
+    # honestly I'm not sure what the 1 at the front is, but I'm afraid to take it out
+    layer.reshape_dims = (1, orig_shape[0], orig_shape[1], 1, 1)
+    delta_trt = layer.get_output(0)
+
+    var_trt = ctx.network.add_scale(delta_trt, trt.ScaleMode.UNIFORM, np.zeros_like(eps_np), np.ones_like(eps_np), 2 * np.ones_like(eps_np)).get_output(0)
+    var_trt = ctx.network.add_reduce(var_trt, trt.ReduceOperation.AVG, reduce_axes_adv, keep_dims).get_output(0)
+
+    # compute sqrt(var + eps)
+    var_trt = ctx.network.add_scale(var_trt, trt.ScaleMode.UNIFORM, eps_np, np.ones_like(eps_np), 0.5 * np.ones_like(eps_np)).get_output(0)
+
+    # compute final result
+    result_trt = ctx.network.add_elementwise(delta_trt, var_trt, trt.ElementWiseOperation.DIV).get_output(0)
+
+
+    weight_np = weight.detach().cpu().numpy()
+    bias_np = bias.detach().cpu().numpy()
+
+    result_trt = ctx.network.add_scale_nd(result_trt, trt.ScaleMode.CHANNEL, bias_np, weight_np, np.ones_like(bias_np), 2).get_output(0)
+
+    layer = ctx.network.add_shuffle(result_trt)
+    layer.reshape_dims = tuple(orig_shape)
+    y_trt = layer.get_output(0)
+
+    output._trt = y_trt
+
         
 # STATIC
 
