@@ -15,6 +15,17 @@ def convert_mul(ctx):
     layer = ctx.network.add_elementwise(input_a_trt, input_b_trt, trt.ElementWiseOperation.PROD)
     output._trt = layer.get_output(0)
 
+    
+@tensorrt_converter('torch.matmul')
+def convert_matmul(ctx):
+    input_a = ctx.method_args[0]
+    input_b = ctx.method_args[1]
+    input_a_trt, input_b_trt = trt_(ctx.network, input_a, input_b)
+    output = ctx.method_return
+    layer = ctx.network.add_matrix_multiply(input_a_trt, trt.MatrixOperation.NONE, input_b_trt, trt.MatrixOperation.NONE)
+    output._trt = layer.get_output(0)
+    
+
 class Mul(torch.nn.Module):
     def __init__(self):
         super(Mul, self).__init__()
